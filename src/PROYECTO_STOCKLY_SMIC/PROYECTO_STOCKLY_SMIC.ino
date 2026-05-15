@@ -1,105 +1,366 @@
+
+#include <Arduino.h>
 #include "HX711.h"
 
-// --- Pines Celda y Sensores ---
-const int DOUT_PIN = 21;
-const int SCK_PIN = 3;
-const int IR_PIN = 19;
-const int LED_STATUS = 5;
+#if defined(ESP32)
+  #include <esp_arduino_version.h>
+#endif
 
-// --- Pines Puente H (Motores DC) ---
-// Cada motor usa 2 pines para el sentido de giro
-const int M1_IN1 = 18; const int M1_IN2 = 17;
-const int M2_IN1 = 16; const int M2_IN2 = 4;
-const int M3_IN1 = 0;  const int M3_IN2 = 2;
 
-// --- Pines Ultrasonido ---
-const int TRIGS[] = {13, 14, 27};
-const int ECHOS[] = {12, 15, 26};
+#define HX711_DOUT 21
+#define HX711_CLK   3
 
-// --- Configuración ---
-const float PESO_UNITARIO = 0.250; 
-const float CALIBRACION = 2280.f;
-const int DIST_UMBRAL = 10; 
-const unsigned long MAX_TIME = 6000; // Timeout de 6 segundos
+HX711 balanza;
 
-HX711 scale;
+const float FACTOR_ESCALA = 49.5;   // Ajustar con tu calibración real
+const int MUESTRAS_TARA = 50;
+const int MUESTRAS_PESO = 10;
+const unsigned long PERIODO_LECTURA_PESO_MS = 500;
+const long PESO_MINIMO_PRODUCTO_G = 20;
 
-void setup() {
-  Serial.begin(115200);
-  
-  pinMode(IR_PIN, INPUT);
-  pinMode(LED_STATUS, OUTPUT);
-  
-  // Configurar motores
-  pinMode(M1_IN1, OUTPUT); pinMode(M1_IN2, OUTPUT);
-  pinMode(M2_IN1, OUTPUT); pinMode(M2_IN2, OUTPUT);
-  pinMode(M3_IN1, OUTPUT); pinMode(M3_IN2, OUTPUT);
 
-  for(int i=0; i<3; i++) {
-    pinMode(TRIGS[i], OUTPUT);
-    pinMode(ECHOS[i], INPUT);
-  }
+const int PWM_BAJO = 75;                  
+const unsigned long TIEMPO_VUELTA_MS = 3500;
+const float UMBRAL_PRODUCTO_CM = 12.0;   
+const unsigned long TIMEOUT_ULTRASONIDO_US = 25000UL;
+const unsigned long PERIODO_CHEQUEO_ULTRASONIDO_MS = 300;
 
-  scale.begin(DOUT_PIN, SCK_PIN);
-  scale.set_scale(CALIBRACION);
-  scale.tare(); // Pone a cero la góndola [cite: 130]
+// PWM ESP32
+const uint32_t PWM_FRECUENCIA = 5000;
+const uint8_t PWM_RESOLUCION_BITS = 8;
+
+struct BandaTransportadora {
+  const char* nombre;
+
+  // Sensor ultrasónico
+  uint8_t trigPin;
+  uint8_t echoPin;
+
+  // Motor
+  uint8_t pwmPin;
+  uint8_t in1Pin;
+  uint8_t in2Pin;
+
+  // Canal PWM para ESP32 Arduino Core 2.x
+  uint8_t pwmChannel;
+
+  bool moviendo;
+  bool vueltaHechaSinProducto;
+  unsigned long inicioMovimiento;
+};
+
+
+BandaTransportadora bandas[3] = {
+  // nombre      TRIG ECHO PWM IN1 IN2 CANAL moviendo vuelta inicio
+  { "Banda 1",    4,   5,  10, 11, 12,   0,   false, false, 0 },
+  { "Banda 2",    6,   7,  13, 14, 15,   1,   false, false, 0 },
+  { "Banda 3",    8,   9,  16, 17, 18,   2,   false, false, 0 }
+};
+
+bool sistemaListo = false;
+unsigned long ultimoPesoMs = 0;
+unsigned long ultimoChequeoUltrasonidoMs = 0;
+
+
+void configurarPWM(uint8_t pin, uint8_t canal) {
+#if defined(ESP32)
+  #if ESP_ARDUINO_VERSION_MAJOR >= 3
+    // Arduino-ESP32 Core 3.x
+    ledcAttachChannel(pin, PWM_FRECUENCIA, PWM_RESOLUCION_BITS, canal);
+  #else
+    // Arduino-ESP32 Core 2.x
+    ledcSetup(canal, PWM_FRECUENCIA, PWM_RESOLUCION_BITS);
+    ledcAttachPin(pin, canal);
+  #endif
+#else
+  pinMode(pin, OUTPUT);
+#endif
 }
 
-float obtenerDistancia(int i) {
-  digitalWrite(TRIGS[i], LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIGS[i], HIGH);
+void escribirPWM(uint8_t pin, uint8_t canal, uint8_t duty) {
+#if defined(ESP32)
+  #if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcWrite(pin, duty);
+  #else
+    ledcWrite(canal, duty);
+  #endif
+#else
+  analogWrite(pin, duty);
+#endif
+}
+
+void detenerBanda(uint8_t i);
+
+void configurarMotores() {
+  for (uint8_t i = 0; i < 3; i++) {
+    pinMode(bandas[i].in1Pin, OUTPUT);
+    pinMode(bandas[i].in2Pin, OUTPUT);
+
+    configurarPWM(bandas[i].pwmPin, bandas[i].pwmChannel);
+
+    escribirPWM(bandas[i].pwmPin, bandas[i].pwmChannel, 0);
+    digitalWrite(bandas[i].in1Pin, LOW);
+    digitalWrite(bandas[i].in2Pin, LOW);
+  }
+}
+
+void iniciarBanda(uint8_t i) {
+  BandaTransportadora &b = bandas[i];
+
+  digitalWrite(b.in1Pin, HIGH);
+  digitalWrite(b.in2Pin, LOW);
+
+  escribirPWM(b.pwmPin, b.pwmChannel, PWM_BAJO);
+
+  b.moviendo = true;
+  b.inicioMovimiento = millis();
+
+  Serial.print("[");
+  Serial.print(b.nombre);
+  Serial.println("] Sin producto -> inicia una vuelta con PWM bajo");
+}
+
+void detenerBanda(uint8_t i) {
+  BandaTransportadora &b = bandas[i];
+
+  escribirPWM(b.pwmPin, b.pwmChannel, 0);
+  digitalWrite(b.in1Pin, LOW);
+  digitalWrite(b.in2Pin, LOW);
+
+  b.moviendo = false;
+  b.vueltaHechaSinProducto = true;
+
+  Serial.print("[");
+  Serial.print(b.nombre);
+  Serial.println("] Vuelta completa -> motor detenido");
+}
+
+
+void configurarUltrasonidos() {
+  for (uint8_t i = 0; i < 3; i++) {
+    pinMode(bandas[i].trigPin, OUTPUT);
+    pinMode(bandas[i].echoPin, INPUT);
+    digitalWrite(bandas[i].trigPin, LOW);
+  }
+}
+
+float medirDistanciaCm(uint8_t i) {
+  BandaTransportadora &b = bandas[i];
+
+  digitalWrite(b.trigPin, LOW);
+  delayMicroseconds(3);
+
+  digitalWrite(b.trigPin, HIGH);
   delayMicroseconds(10);
-  digitalWrite(TRIGS[i], LOW);
-  return pulseIn(ECHOS[i], HIGH) * 0.034 / 2;
+  digitalWrite(b.trigPin, LOW);
+
+  unsigned long duracion = pulseIn(b.echoPin, HIGH, TIMEOUT_ULTRASONIDO_US);
+
+  if (duracion == 0) {
+    return 999.0;
+  }
+
+  return duracion / 58.0;
 }
 
-void controlarMotor(int id, bool encender) {
-  int p1, p2;
-  if(id == 0) { p1 = M1_IN1; p2 = M1_IN2; }
-  else if(id == 1) { p1 = M2_IN1; p2 = M2_IN2; }
-  else { p1 = M3_IN1; p2 = M3_IN2; }
+bool hayProducto(uint8_t i, float *distanciaLeida = nullptr) {
+  float distancia = medirDistanciaCm(i);
 
-  if(encender) {
-    digitalWrite(p1, HIGH); // Giro hacia adelante
-    digitalWrite(p2, LOW);
+  if (distanciaLeida != nullptr) {
+    *distanciaLeida = distancia;
+  }
+
+  return distancia <= UMBRAL_PRODUCTO_CM;
+}
+
+
+void calibrarBascula() {
+  Serial.println();
+  Serial.println("        STOCKLY - ESP32-S3");
+
+  balanza.begin(HX711_DOUT, HX711_CLK);
+
+  Serial.println("Inicializando HX711...");
+  delay(300);
+
+  if (!balanza.is_ready()) {
+    Serial.println("ADVERTENCIA: HX711 no detectado.");
+    Serial.println("Revisa DOUT, CLK, VCC, GND y alimentacion.");
+    // No bloquea el sistema para permitir probar bandas.
   } else {
-    digitalWrite(p1, LOW);
-    digitalWrite(p2, LOW);
+    Serial.print("Lectura inicial ADC: ");
+    Serial.println(balanza.read());
+  }
+
+  Serial.println("Retira todos los productos de la bascula.");
+  Serial.print("Tarando a cero ");
+
+  balanza.set_scale(FACTOR_ESCALA);
+
+  for (int i = 0; i < 20; i++) {
+    Serial.print("=");
+    delay(120);
+  }
+
+  if (balanza.is_ready()) {
+    balanza.tare(MUESTRAS_TARA);
+    Serial.println(" OK");
+  } else {
+    Serial.println(" HX711 no listo");
+  }
+
+  Serial.println("Sistema listo.");
+  Serial.println("Comandos: r=tara, p=probar todas, 1/2/3=probar banda");
+  Serial.println();
+
+  sistemaListo = true;
+}
+
+long leerPesoGramos() {
+  if (!balanza.is_ready()) {
+    return 0;
+  }
+
+  long peso = balanza.get_units(MUESTRAS_PESO);
+
+  if (peso < 0 && peso > -PESO_MINIMO_PRODUCTO_G) {
+    peso = 0;
+  }
+
+  return peso;
+}
+
+void imprimirPesoPeriodico() {
+  if (millis() - ultimoPesoMs < PERIODO_LECTURA_PESO_MS) {
+    return;
+  }
+
+  ultimoPesoMs = millis();
+
+  long peso = leerPesoGramos();
+
+  Serial.print("[Bascula] Peso: ");
+
+  if (peso >= 1000) {
+    Serial.print(peso / 1000.0, 2);
+    Serial.println(" kg");
+  } else {
+    Serial.print(peso);
+    Serial.println(" g");
   }
 }
 
-void moverBanda(int id) {
-  unsigned long t_inicio = millis();
-  
-  // Mover mientras no haya producto al frente
-  while (obtenerDistancia(id) > DIST_UMBRAL) {
-    if (millis() - t_inicio > MAX_TIME) break; // Evita giro infinito
-    controlarMotor(id, true);
-    delay(50); 
+
+void actualizarBanda(uint8_t i) {
+  BandaTransportadora &b = bandas[i];
+
+  if (b.moviendo) {
+    if (millis() - b.inicioMovimiento >= TIEMPO_VUELTA_MS) {
+      detenerBanda(i);
+    }
+    return;
   }
-  controlarMotor(id, false);
+
+  float distancia = 0;
+  bool producto = hayProducto(i, &distancia);
+
+  Serial.print("[");
+  Serial.print(b.nombre);
+  Serial.print("] Distancia: ");
+
+  if (distancia >= 900.0) {
+    Serial.print("sin eco");
+  } else {
+    Serial.print(distancia, 1);
+    Serial.print(" cm");
+  }
+
+  Serial.print(" -> ");
+
+  if (producto) {
+    Serial.println("producto detectado");
+    b.vueltaHechaSinProducto = false;
+    return;
+  }
+
+  Serial.println("NO hay producto");
+
+  if (!b.vueltaHechaSinProducto) {
+    iniciarBanda(i);
+  }
 }
 
-void loop() {
-  float peso = scale.get_units(5);
-  int stock = (peso > 0.05) ? (int)(peso / PESO_UNITARIO) : 0; // 
-  bool hayGente = (digitalRead(IR_PIN) == LOW); // [cite: 132]
+void actualizarBandas() {
+  if (millis() - ultimoChequeoUltrasonidoMs < PERIODO_CHEQUEO_ULTRASONIDO_MS) {
+    return;
+  }
 
-  // Lógica: Si falta stock y nadie está tocando la góndola [cite: 140]
-  if (stock < 6 && !hayGente) {
-    for(int i=0; i<3; i++) {
-      if (obtenerDistancia(i) > DIST_UMBRAL) {
-        moverBanda(i);
+  ultimoChequeoUltrasonidoMs = millis();
+
+  for (uint8_t i = 0; i < 3; i++) {
+    actualizarBanda(i);
+  }
+}
+
+
+void revisarComandosSerial() {
+  if (!Serial.available()) {
+    return;
+  }
+
+  char c = Serial.read();
+
+  if (c == 'r' || c == 'R') {
+    Serial.println("Recalibrando tara. Retira productos de la bascula...");
+    delay(1500);
+
+    if (balanza.is_ready()) {
+      balanza.tare(MUESTRAS_TARA);
+      Serial.println("Tara actualizada.");
+    } else {
+      Serial.println("HX711 no listo. No se pudo tarar.");
+    }
+  }
+
+  if (c == 'p' || c == 'P') {
+    Serial.println("Prueba manual: una vuelta en las 3 bandas.");
+    for (uint8_t i = 0; i < 3; i++) {
+      if (!bandas[i].moviendo) {
+        bandas[i].vueltaHechaSinProducto = false;
+        iniciarBanda(i);
       }
     }
   }
 
-  // Alerta visual de stock bajo [cite: 135, 151]
-  digitalWrite(LED_STATUS, (stock <= 2) ? HIGH : LOW);
+  if (c >= '1' && c <= '3') {
+    uint8_t i = c - '1';
 
-  Serial.print("Peso: "); Serial.print(peso);
-  Serial.print(" | Stock: "); Serial.println(stock);
-  
+    Serial.print("Prueba manual: ");
+    Serial.println(bandas[i].nombre);
+
+    if (!bandas[i].moviendo) {
+      bandas[i].vueltaHechaSinProducto = false;
+      iniciarBanda(i);
+    }
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
   delay(1000);
+
+  configurarMotores();
+  configurarUltrasonidos();
+  calibrarBascula();
+}
+
+void loop() {
+  if (!sistemaListo) {
+    return;
+  }
+
+  revisarComandosSerial();
+  imprimirPesoPeriodico();
+  actualizarBandas();
 }
